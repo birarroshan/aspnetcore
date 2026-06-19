@@ -4,8 +4,10 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading;
 
 #nullable enable
 
@@ -24,6 +26,14 @@ internal static class TestCertificateFactory
     private const string ClientAuthenticationOidFriendlyName = "Client Authentication";
     private const string CodeSigningOid = "1.3.6.1.5.5.7.3.3";
     private const string CodeSigningOidFriendlyName = "Code Signing";
+    private const int MutexTimeout = 120 * 1000;
+    private const string ImportPfxMutexName = "Global\\KestrelTests.Certificates.LoadPfxCertificate";
+    private const X509KeyStorageFlags ExportableKeyStorageFlags = X509KeyStorageFlags.Exportable;
+    private const X509KeyStorageFlags ExportableEphemeralKeyStorageFlags =
+        X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet;
+    private static readonly Mutex? _importPfxMutex = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ?
+        new Mutex(initiallyOwned: false, ImportPfxMutexName) :
+        null;
 
     internal static Oid ServerAuthentication => new(ServerAuthenticationOid, ServerAuthenticationOidFriendlyName);
 
@@ -174,7 +184,31 @@ internal static class TestCertificateFactory
         var notAfter = DateTimeOffset.UtcNow.AddYears(5);
         using var certificate = request.CreateSelfSigned(notBefore, notAfter);
 
-        return new X509Certificate2(certificate.Export(X509ContentType.Pfx), string.Empty, X509KeyStorageFlags.Exportable);
+        return ImportPfx(certificate.Export(X509ContentType.Pfx), string.Empty);
+    }
+
+    private static X509Certificate2 ImportPfx(byte[] pfx, string password)
+    {
+        if (_importPfxMutex is not null && !_importPfxMutex.WaitOne(MutexTimeout))
+        {
+            throw new InvalidOperationException("Cannot acquire the global certificate mutex.");
+        }
+
+        try
+        {
+            try
+            {
+                return new X509Certificate2(pfx, password, ExportableEphemeralKeyStorageFlags);
+            }
+            catch (PlatformNotSupportedException)
+            {
+                return new X509Certificate2(pfx, password, ExportableKeyStorageFlags);
+            }
+        }
+        finally
+        {
+            _importPfxMutex?.ReleaseMutex();
+        }
     }
 
     private static X509EnhancedKeyUsageExtension CreateEnhancedKeyUsageExtension(Oid[] enhancedKeyUsages, bool critical)
